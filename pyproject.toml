@@ -1,0 +1,21 @@
+[project]
+name = "als-parser"
+version = "0.1.0"
+description = "A tool to parse Ableton Live Set (.als) files and search for sample references"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.0.0",
+]
+
+[project.scripts]
+als-parser = "als_parser.cli:main"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
