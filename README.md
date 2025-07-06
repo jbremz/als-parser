@@ -39,6 +39,8 @@ uv pip install -e .
 
 The tool provides four main commands:
 
+> **Note for Development Setup**: If you installed using `uv sync` and `uv pip install -e .`, you need to prefix all commands with `uv run`. For example: `uv run als-parser scan ...`
+
 #### 1. Scan for ALS files and extract sample references
 
 ```bash
