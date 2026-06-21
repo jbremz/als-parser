@@ -11,6 +11,63 @@ A Python tool to parse Ableton Live Set (.als) files and extract comprehensive i
 - 💾 **Export Results**: Save results to JSON for further analysis
 - 🚀 **Fast & Reliable**: Built with Python's standard library for maximum compatibility
 - 🔓 **Breakthrough Technology**: Successfully extracts readable VST preset data previously thought impossible to recover
+- 🔁 **VST2 → VST3 / AU Preset Porting**: Recover dead VST2 plugin state into the same plugin's VST3 or AudioUnit replacement, in-place inside the `.als`
+
+## Preset porting (VST2 → VST3 / AU)
+
+When macOS drops VST2 support, VST2 devices stop loading but their state is still
+stored in the `.als`. `als_parser.preset_port` copies that state into the VST3 /
+AU replacement you've added in Ableton. The plugin's state *chunk* is the thing
+Ableton restores on load, so porting means writing the right chunk:
+
+- **VST2 → VST3**: copy the VST2 buffer into `<Vst3Preset><ProcessorState>`.
+  Only valid when the plugin serialises both formats identically (e.g. NI
+  Transient Master does; Reaktor 6 does **not** — `CSAR` v5 vs v6).
+- **VST2 → AU**: Ableton stores AU state as a `.aupreset` plist in
+  `<AuPreset><Buffer>`. The real data sits in a plist key — `vstdata` (a VST2
+  FXP, used by soundhack) or `AM_STATE` (u-he text patch). Rewrite that key.
+
+The module is surgical: it locates a device by track + name + format and rewrites
+a single element, so ElementTree round-trips the rest of the file losslessly.
+
+### Whole-project recovery (`scripts/recover_vst2.py`)
+
+For doing this across many projects, the recovery tool automates the entire
+workflow — you never hand-edit a runner:
+
+```bash
+# 1. discover dead VST2 + installed replacements; writes a starter spec
+python scripts/recover_vst2.py analyze "MyProject/Song.als"
+
+# 2. (edit recover.spec.json: VST3 vs AU per plugin; target_name/param_map
+#     for renamed plugins) then dry-run
+python scripts/recover_vst2.py recover "MyProject/Song.als"
+
+# 3. apply
+python scripts/recover_vst2.py recover "MyProject/Song.als" --apply
+```
+
+What it does, per affected track: **duplicates** the track (muted, `- COMPAT`)
+exactly like Ableton's Cmd-D, **swaps** each dead VST2 device for the chosen
+VST3/AU replacement, and **ports** the preset state. Building blocks:
+
+- `track_ops.py` — Ableton-faithful track duplication. The id model was reverse
+  -engineered from Ableton 12's own duplicates: only pointee-space *definitions*
+  (`AutomationTarget`/`ModulationTarget`/`Pointee`/`*ModulationTarget`/
+  `ControllerTargets.N`) get fresh sequential ids, only `PointeeId` references
+  are rewritten, the track gets a new id, `NextPointeeId` is bumped; local ids
+  (devices, clips, params) are left alone.
+- `device_templates.py` — finds installed VST3/AU replacements and *harvests* a
+  real device node for each plugin from the project / your library (cached), so
+  we never have to synthesise plugin identity from scratch.
+- `recover.py` — orchestration + per-target state porting, with a dry-run report.
+
+Safety: originals are never touched (work happens on the duplicates), a
+`.pre-recover-bak` copy is made before writing, and anything that can't be ported
+confidently (incompatible chunk formats like Reaktor's VST2↔VST3, a missing
+template) is **reported with a manual-recall hint**, never silently broken.
+
+See `src/als_parser/preset_port.py` for the low-level porting primitives.
 
 ## Installation
 
