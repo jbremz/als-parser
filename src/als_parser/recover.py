@@ -4,18 +4,29 @@ Given a project .als and a list of affected (dead) VST2 plugins plus the format
 to move each to, this:
 
   1. finds every track containing an affected VST2 device,
-  2. duplicates that track (muted, "- COMPAT"), exactly like Ableton's Cmd-D,
-  3. swaps each dead VST2 device in the copy for the chosen VST3/AU replacement
-     (built from a harvested device template, ids remapped), and
+  2. depending on *mode*:
+       - "inplace" (default): converts the dead devices directly on their own
+         tracks and writes the result to a NEW .als next to the original
+         ("<name> [recovered].als") — the original file is never touched;
+       - "duplicate": duplicates each affected track (muted, "- COMPAT"),
+         exactly like Ableton's Cmd-D, and converts the copies, writing back
+         to the same file (with a safety backup),
+  3. swaps each dead VST2 device for the chosen VST3/AU replacement
+     (identity taken from a harvested device template), and
   4. ports the old preset state across with the method that fits the target:
-       - VST3: copy the VST2 chunk into ProcessorState *iff* the formats match,
-       - AU soundhack: rewrite the embedded FXP floats from the VST2 params,
-       - AU u-he: copy the text patch into AM_STATE.
+       - VST3: graft the template's PluginDesc onto the existing device wrapper
+         and copy the VST2 chunk into ProcessorState *iff* the formats match.
+         Keeping the wrapper preserves the ParameterList and its
+         AutomationTargets, so parameter automation survives the swap.
+       - AU: replace the whole device node (the tag and parameter space differ);
+         state goes into the .aupreset plist — soundhack's `vstdata` FXP floats
+         are rewritten from the VST2 params, u-he's `AM_STATE` gets the text
+         patch. Automation that pointed at the old device is reported for
+         manual relinking.
 
 Anything it can't do confidently (incompatible chunk formats, missing template,
-unknown AU state layout) is reported, never silently botched.
-
-The original tracks are left untouched; everything happens on the duplicates.
+unknown AU state layout) is reported — and the dead VST2 left in place with a
+recall hint — never silently botched.
 """
 
 from __future__ import annotations
@@ -103,14 +114,42 @@ def _vst3_format_compatible(vst2_chunk_bytes: bytes, template_state_hex: str) ->
     return vst2_chunk_bytes[:6] == tpl[:6]
 
 
-def _port_vst3(new_dev: ET.Element, src_chunk: bytes) -> tuple:
-    ps = new_dev.find(".//Vst3Preset/ProcessorState")
-    if ps is None:
+def _replace_child(parent: ET.Element, old: ET.Element, new: ET.Element) -> None:
+    """Swap *old* for *new* at the same position, preserving indentation."""
+    idx = list(parent).index(old)
+    new.tail = old.tail
+    parent[idx] = new
+
+
+def _convert_vst3_inplace(root: ET.Element, dev: ET.Element, tpl: ET.Element,
+                          src_chunk: bytes) -> tuple:
+    """Convert a VST2 PluginDevice to VST3 by grafting the template's PluginDesc
+    (and SourceContext) onto the existing wrapper, then writing the chunk into
+    ProcessorState. The wrapper — ParameterList, AutomationTargets, On switch —
+    is kept, so parameter automation keeps working.
+
+    The grafted PluginDesc carries pointee defs (ControllerTargets.N inside
+    Vst3Preset), so it gets fresh ids like any spliced subtree.
+    """
+    tpl_ps = tpl.find(".//Vst3Preset/ProcessorState")
+    if tpl_ps is None:
         return False, "no ProcessorState in template"
-    if not _vst3_format_compatible(src_chunk, ps.text or ""):
+    if not _vst3_format_compatible(src_chunk, tpl_ps.text or ""):
         return False, "VST2/VST3 chunk formats differ (needs manual recall)"
-    ps.text = _hex(src_chunk)
-    return True, f"{len(src_chunk)}B -> ProcessorState"
+
+    new_pd = copy.deepcopy(tpl.find("PluginDesc"))
+    T.remap_pointee_ids(root, new_pd)
+    new_pd.find(".//Vst3Preset/ProcessorState").text = _hex(src_chunk)
+    _replace_child(dev, dev.find("PluginDesc"), new_pd)
+
+    old_sc, tpl_sc = dev.find("SourceContext"), tpl.find("SourceContext")
+    if old_sc is not None and tpl_sc is not None:
+        _replace_child(dev, old_sc, copy.deepcopy(tpl_sc))
+
+    mpe = dev.find("MpePitchBendUsesTuning")
+    if mpe is not None:
+        mpe.set("Value", "true")
+    return True, f"{len(src_chunk)}B -> ProcessorState (wrapper kept, automation intact)"
 
 
 def _port_au(new_dev: ET.Element, src_chunk: bytes, src_params: dict,
@@ -138,6 +177,45 @@ def _port_au(new_dev: ET.Element, src_chunk: bytes, src_params: dict,
         set_au_plist(buf, plist)
         return True, f"AM_STATE {len(plist['AM_STATE'])}B"
     return False, "unknown AU state layout (no vstdata/AM_STATE)"
+
+
+def _process_device(root: ET.Element, pmap: dict, dev: ET.Element,
+                    spec: "PluginSpec", tpl: ET.Element, tname: str) -> Action:
+    """Convert one dead VST2 device according to *spec*. Mutates the tree.
+
+    On failure the device is left untouched (dead but data-intact) and the
+    action carries a manual-recall hint extracted from the chunk.
+    """
+    src_chunk = vst2_chunk(dev)
+    target = f"{spec.target_name} [{spec.target_fmt}]"
+
+    if spec.target_fmt == "VST3":
+        ok, detail = _convert_vst3_inplace(root, dev, tpl, src_chunk)
+        if not ok:
+            refs = _extract_refs(src_chunk)
+            return Action(tname, spec.vst2_name, target, "skipped",
+                          detail + (f"; recall: {refs}" if refs else ""))
+        return Action(tname, spec.vst2_name, target, "ported", detail)
+
+    # AU: tag + parameter space differ, so the whole node is replaced
+    new_dev = copy.deepcopy(tpl)
+    T.remap_pointee_ids(root, new_dev)
+    ok, detail = _port_au(new_dev, src_chunk, param_values(dev), spec.param_map)
+    if not ok:
+        refs = _extract_refs(src_chunk)
+        return Action(tname, spec.vst2_name, target, "skipped",
+                      detail + (f"; recall: {refs}" if refs else ""))
+
+    old_defs = {x.get("Id") for x in dev.iter()
+                if "Id" in x.attrib and T.is_pointee_def(x.tag)}
+    _replace_child(pmap[dev], dev, new_dev)
+    pmap[new_dev] = pmap[dev]
+
+    orphans = sum(1 for x in root.iter()
+                  if x.tag == "PointeeId" and x.get("Value") in old_defs)
+    if orphans:
+        detail += f"; WARNING: {orphans} automation ref(s) need manual relink"
+    return Action(tname, spec.vst2_name, target, "ported", detail)
 
 
 # --------------------------------------------------------------------------- #
@@ -172,9 +250,24 @@ def analyze_project(als_path: Path, log=print) -> list:
 # --------------------------------------------------------------------------- #
 
 def recover_project(als_path: Path, specs, library_paths=None,
-                    cache_dir=None, apply=False, log=print) -> list:
-    """Run recovery. Returns a list[Action]. Writes the file only if apply=True."""
+                    cache_dir=None, apply=False, log=print,
+                    mode: str = "inplace", output=None) -> list:
+    """Run recovery. Returns a list[Action]. Writes only if apply=True.
+
+    mode="inplace" (default): convert devices on their own tracks, write to a
+    NEW file (*output*, default "<name> [recovered].als") — original untouched.
+    mode="duplicate": convert on muted "- COMPAT" track copies, write back to
+    the same file with a .pre-recover-bak safety copy.
+    """
+    if mode not in ("inplace", "duplicate"):
+        raise ValueError(f"unknown mode {mode!r}")
     als_path = Path(als_path)
+    out_path = None
+    if mode == "inplace":
+        out_path = Path(output) if output else als_path.with_name(
+            f"{als_path.stem} [recovered].als")
+        if out_path.resolve() == als_path.resolve():
+            raise ValueError("inplace mode must write to a new file, not the original")
     specs_by_name = {s.vst2_name: s for s in specs}
     names = set(specs_by_name)
 
@@ -208,44 +301,22 @@ def recover_project(als_path: Path, specs, library_paths=None,
     actions = []
     for track in tracks:
         tname = track.find(".//Name/EffectiveName").get("Value")
-        dup = T.duplicate_track(root, track, new_name=f"{tname} - COMPAT", mute=True)
+        if mode == "duplicate":
+            work = T.duplicate_track(root, track, new_name=f"{tname} - COMPAT",
+                                     mute=True)
+        else:
+            work = track
 
-        pmap = _parent_map(dup)
-        for dev in _affected_vst2_devices(dup, names):
+        pmap = _parent_map(work)
+        for dev in _affected_vst2_devices(work, names):
             spec = specs_by_name[_device_name(dev)]
-            key = (spec.target_name, spec.target_fmt)
-            tpl = templates.get(key)
+            tpl = templates.get((spec.target_name, spec.target_fmt))
             if tpl is None:
-                actions.append(Action(tname, spec.vst2_name, f"{spec.target_name} [{spec.target_fmt}]",
-                                      "skipped", "no device template"))
+                actions.append(Action(
+                    tname, spec.vst2_name, f"{spec.target_name} [{spec.target_fmt}]",
+                    "skipped", "no device template"))
                 continue
-
-            src_chunk = vst2_chunk(dev)
-            src_params = param_values(dev)
-            new_dev = copy.deepcopy(tpl)
-            T.remap_pointee_ids(root, new_dev)
-
-            if spec.target_fmt == "VST3":
-                ok, detail = _port_vst3(new_dev, src_chunk)
-            else:
-                ok, detail = _port_au(new_dev, src_chunk, src_params, spec.param_map)
-
-            target = f"{spec.target_name} [{spec.target_fmt}]"
-            if not ok:
-                # can't port state confidently: leave the dead VST2 in place (no
-                # data lost) and surface the recipe to recall it by hand.
-                refs = _extract_refs(src_chunk)
-                actions.append(Action(tname, spec.vst2_name, target, "skipped",
-                                      detail + (f"; recall: {refs}" if refs else "")))
-                continue
-
-            # splice the new device in where the dead one was
-            parent = pmap[dev]
-            idx = list(parent).index(dev)
-            new_dev.tail = dev.tail
-            parent[idx] = new_dev
-            pmap[new_dev] = parent
-            actions.append(Action(tname, spec.vst2_name, target, "ported", detail))
+            actions.append(_process_device(root, pmap, dev, spec, tpl, tname))
 
     # report
     log("\nActions:")
@@ -261,13 +332,17 @@ def recover_project(als_path: Path, specs, library_paths=None,
     log("\nXML re-parse: OK")
 
     if apply:
-        bak = als_path.with_suffix(".als.pre-recover-bak")
-        if not bak.exists():
-            import shutil
-            shutil.copy2(als_path, bak)
-            log(f"Safety copy: {bak.name}")
-        save_als(tree, als_path)
-        log(f"Wrote {als_path}")
+        if mode == "inplace":
+            save_als(tree, out_path)
+            log(f"Wrote {out_path}  (original untouched)")
+        else:
+            bak = als_path.with_suffix(".als.pre-recover-bak")
+            if not bak.exists():
+                import shutil
+                shutil.copy2(als_path, bak)
+                log(f"Safety copy: {bak.name}")
+            save_als(tree, als_path)
+            log(f"Wrote {als_path}")
     else:
         log("\nDry run — re-run with apply=True to write.")
     return actions

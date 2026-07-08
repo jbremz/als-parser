@@ -43,13 +43,18 @@ python scripts/recover_vst2.py analyze "MyProject/Song.als"
 #     for renamed plugins) then dry-run
 python scripts/recover_vst2.py recover "MyProject/Song.als"
 
-# 3. apply
+# 3. apply — default writes a NEW "Song [recovered].als"; original untouched
 python scripts/recover_vst2.py recover "MyProject/Song.als" --apply
+
+# or: muted "- COMPAT" track copies in the same file (A/B against originals)
+python scripts/recover_vst2.py recover "MyProject/Song.als" --apply --mode duplicate
 ```
 
-What it does, per affected track: **duplicates** the track (muted, `- COMPAT`)
-exactly like Ableton's Cmd-D, **swaps** each dead VST2 device for the chosen
-VST3/AU replacement, and **ports** the preset state. Building blocks:
+Two modes. **inplace** (default) converts each dead device on its own track and
+writes a new `[recovered].als` — for VST3 targets it grafts the replacement onto
+the existing device wrapper, so parameter automation survives. **duplicate**
+copies each affected track (muted, `- COMPAT`) exactly like Ableton's Cmd-D and
+converts the copies, keeping the originals visible for A/B. Building blocks:
 
 - `track_ops.py` — Ableton-faithful track duplication. The id model was reverse
   -engineered from Ableton 12's own duplicates: only pointee-space *definitions*
@@ -68,6 +73,11 @@ confidently (incompatible chunk formats like Reaktor's VST2↔VST3, a missing
 template) is **reported with a manual-recall hint**, never silently broken.
 
 See `src/als_parser/preset_port.py` for the low-level porting primitives.
+
+There is also a Claude Code skill (`.claude/skills/vst2-recovery/`) that glues
+the workflow together: give it a broken project (plus, optionally, a screenshot
+of Ableton's missing-plugin warning) and it identifies the dead plugins, builds
+the spec, runs the recovery, and reports what needs manual recall.
 
 ## Installation
 

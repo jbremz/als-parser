@@ -15,9 +15,15 @@ Workflow
 
        python scripts/recover_vst2.py recover "MyProject/Song.als"
 
-3. Apply (duplicates affected tracks as "- COMPAT", swaps plugins, ports state):
+3. Apply. Default mode converts devices in place and writes a NEW file
+   ("Song [recovered].als") — the original is never touched:
 
        python scripts/recover_vst2.py recover "MyProject/Song.als" --apply
+
+   Or keep the originals visible side-by-side with muted "- COMPAT" track
+   copies, written back into the same file (safety backup made):
+
+       python scripts/recover_vst2.py recover "MyProject/Song.als" --apply --mode duplicate
 
 Templates are harvested from the project first, then the surrounding Ableton
 library (auto-detected, cached under ~/.als_recover_cache). Anything that can't
@@ -73,7 +79,8 @@ def cmd_recover(args):
     print(f"Harvesting templates from {len(library_paths)} project(s) under {lib}\n")
 
     recover_project(als, specs, library_paths=library_paths,
-                    cache_dir=CACHE, apply=args.apply)
+                    cache_dir=CACHE, apply=args.apply,
+                    mode=args.mode, output=args.output)
 
 
 def main():
@@ -87,6 +94,12 @@ def main():
     r.add_argument("project")
     r.add_argument("--spec", help="path to spec json (default: recover.spec.json next to project)")
     r.add_argument("--apply", action="store_true", help="write the file (default: dry run)")
+    r.add_argument("--mode", choices=["inplace", "duplicate"], default="inplace",
+                   help="inplace: convert devices on their tracks, write a NEW "
+                        "'[recovered]' file (default). duplicate: muted '- COMPAT' "
+                        "track copies written back to the same file.")
+    r.add_argument("--output", help="output path for inplace mode "
+                                    "(default: '<name> [recovered].als')")
     r.set_defaults(func=cmd_recover)
     args = ap.parse_args()
     args.func(args)
