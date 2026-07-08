@@ -66,6 +66,14 @@ converts the copies, keeping the originals visible for A/B. Building blocks:
   real device node for each plugin from the project / your library (cached), so
   we never have to synthesise plugin identity from scratch.
 - `recover.py` — orchestration + per-target state porting, with a dry-run report.
+  Supported vendor state layouts: NI-style VST3 chunk copy, Waves size-prefixed
+  chunks, iZotope DDLY prefix-strip, JUCE (`VC2!` XML or raw `jucePluginState`),
+  soundhack FXP `vstdata`, u-he `AM_STATE`, Soundtoys `soundtoys-data`.
+- `tools/audump.c` — headless AU inspector: instantiates an installed Audio Unit
+  and dumps its default `.aupreset` dict + parameter table. Combined with
+  `device_templates.synthesize_au_device`, this builds a working AU device node
+  for a plugin that was never used as an AU in any saved project, so recovery
+  needs no manual instantiation step.
 
 Safety: originals are never touched (work happens on the duplicates), a
 `.pre-recover-bak` copy is made before writing, and anything that can't be ported
