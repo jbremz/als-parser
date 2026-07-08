@@ -141,6 +141,38 @@ def _replace_child(parent: ET.Element, old: ET.Element, new: ET.Element) -> None
     parent[idx] = new
 
 
+def _unique_sibling_id(parent: ET.Element, elem: ET.Element) -> None:
+    """Give *elem* an Id unique among ALL of its siblings.
+
+    Ableton list ids are scoped per parent element and tag-agnostic — two
+    children of the same parent may never share an Id, whatever their tags
+    (loading fails with 'Non-unique list ids'). A spliced-in device node
+    carries its donor's Id, so it must be re-assigned.
+    """
+    used = set()
+    for sib in parent:
+        if sib is elem:
+            continue
+        v = sib.get("Id")
+        if v is not None and v.lstrip("-").isdigit():
+            used.add(int(v))
+    elem.set("Id", str(max(used, default=-1) + 1))
+
+
+def find_sibling_id_collisions(root: ET.Element) -> list:
+    """All (parent_tag, id, [child_tags]) where siblings share an Id."""
+    from collections import defaultdict
+    out = []
+    for parent in root.iter():
+        ids = defaultdict(list)
+        for c in parent:
+            v = c.get("Id")
+            if v is not None:
+                ids[v].append(c.tag)
+        out.extend((parent.tag, v, tags) for v, tags in ids.items() if len(tags) > 1)
+    return out
+
+
 def _convert_vst3_inplace(root: ET.Element, dev: ET.Element, tpl: ET.Element,
                           src_chunk: bytes) -> tuple:
     """Convert a VST2 PluginDevice to VST3 by grafting the template's PluginDesc
@@ -293,6 +325,7 @@ def _process_device(root: ET.Element, pmap: dict, dev: ET.Element,
     tmap = _automation_target_map(dev, new_dev, spec.param_map)
     _replace_child(pmap[dev], dev, new_dev)
     pmap[new_dev] = pmap[dev]
+    _unique_sibling_id(pmap[new_dev], new_dev)
 
     # relink automation envelopes that pointed at the old device
     relinked = orphans = 0
@@ -426,12 +459,19 @@ def recover_project(als_path: Path, specs, library_paths=None,
         flag = {"ported": "OK ", "swapped-no-state": "WARN", "skipped": "SKIP"}.get(a.status, "?")
         log(f"  [{flag}] {a.track[:24]:24} {a.plugin:18} -> {a.target:24} {a.detail}")
 
-    # validate + write
+    # validate + write: must serialise, re-parse, and have no sibling-id
+    # collisions (Ableton refuses to load 'Non-unique list ids')
     import io
     buf = io.BytesIO()
     tree.write(buf, encoding="utf-8")
     ET.fromstring(buf.getvalue())
-    log("\nXML re-parse: OK")
+    collisions = find_sibling_id_collisions(root)
+    if collisions:
+        for ptag, v, tags in collisions[:10]:
+            log(f"  ID COLLISION in <{ptag}>: Id={v} shared by {tags}")
+        raise RuntimeError(
+            f"{len(collisions)} sibling-id collision(s) — refusing to write")
+    log("\nXML re-parse: OK; sibling ids unique")
 
     if apply:
         if exports:

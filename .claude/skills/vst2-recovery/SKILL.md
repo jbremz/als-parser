@@ -86,8 +86,12 @@ named `.ens`, exact knob state is locked in NI's binary).
 ### 5. Verify
 
 - The tool already validates: XML re-parses, fresh pointee ids collision-free,
-  no dangling `PointeeId`. If you touched library code, also re-check byte
-  equality of a ported chunk vs its source.
+  no dangling `PointeeId`, and **no sibling-id collisions** — Ableton refuses
+  to load a file where two children of the same parent share an `Id`
+  (tag-agnostic; error: "Non-unique list ids"). Any spliced node must get an
+  Id unique among ALL its siblings (`_unique_sibling_id`), not just its tag.
+  If you touched library code, also re-check byte equality of a ported chunk
+  vs its source.
 - Ask the user to open the result in Ableton. Ground truth after they save:
   every replacement device should show `IsPlaceholderDevice=false` (and AU:
   `IsUnusable=false`) in the re-saved file.
