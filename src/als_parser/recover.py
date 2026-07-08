@@ -100,18 +100,38 @@ def _extract_refs(chunk: bytes) -> str:
     return ", ".join(hits[:3])
 
 
-def _vst3_format_compatible(vst2_chunk_bytes: bytes, template_state_hex: str) -> bool:
-    """Heuristic: the VST2 chunk and the VST3 ProcessorState share a structural
-    signature (first 6 bytes encode magic + format version for NI-style chunks).
-    Catches Reaktor (CSAR v5 vs v6 -> version byte differs) while passing
-    Transient Master (identical serialisation)."""
+def _vst3_align(src: bytes, template_state_hex: str) -> Optional[int]:
+    """Decide whether a VST2 chunk can be ported into a VST3 ProcessorState, and
+    at what byte offset. Returns the number of prefix bytes to strip from the
+    VST2 chunk, or None if the formats differ.
+
+    Vendor-verified rules (against reference states from real projects):
+      - JUCE (`VC2!` magic both sides): state is wrapper-independent -> 0.
+        (soothe2, and any plugin using copyXmlToBinary)
+      - Identical first-6-bytes (magic + format version) -> 0. Passes NI
+        Transient Master; correctly rejects Reaktor (CSAR v5 vs v6 differ at
+        the version byte inside the first 6).
+      - Size-prefixed both sides (bytes 0-4 are a content-dependent size,
+        structure matches at 4..16) -> 0. Waves ('TAPS' chunks).
+      - VST2 = 4/8-byte prefix + the exact VST3 stream -> strip the prefix.
+        iZotope DDLY (VST2[4:12] == VST3[0:8]).
+    """
     if not template_state_hex:
-        return False
+        return None
     try:
         tpl = binascii.unhexlify("".join(template_state_hex.split()))
     except binascii.Error:
-        return False
-    return vst2_chunk_bytes[:6] == tpl[:6]
+        return None
+    if src[:4] == b"VC2!" and tpl[:4] == b"VC2!":
+        return 0
+    if src[:6] == tpl[:6]:
+        return 0
+    if src[4:16] == tpl[4:16] and src[4:16] != b"\x00" * 12:
+        return 0
+    for off in (4, 8):
+        if len(src) > off + 8 and src[off:off + 8] == tpl[:8]:
+            return off
+    return None
 
 
 def _replace_child(parent: ET.Element, old: ET.Element, new: ET.Element) -> None:
@@ -134,12 +154,13 @@ def _convert_vst3_inplace(root: ET.Element, dev: ET.Element, tpl: ET.Element,
     tpl_ps = tpl.find(".//Vst3Preset/ProcessorState")
     if tpl_ps is None:
         return False, "no ProcessorState in template"
-    if not _vst3_format_compatible(src_chunk, tpl_ps.text or ""):
+    off = _vst3_align(src_chunk, tpl_ps.text or "")
+    if off is None:
         return False, "VST2/VST3 chunk formats differ (needs manual recall)"
 
     new_pd = copy.deepcopy(tpl.find("PluginDesc"))
     T.remap_pointee_ids(root, new_pd)
-    new_pd.find(".//Vst3Preset/ProcessorState").text = _hex(src_chunk)
+    new_pd.find(".//Vst3Preset/ProcessorState").text = _hex(src_chunk[off:])
     _replace_child(dev, dev.find("PluginDesc"), new_pd)
 
     old_sc, tpl_sc = dev.find("SourceContext"), tpl.find("SourceContext")
@@ -149,7 +170,9 @@ def _convert_vst3_inplace(root: ET.Element, dev: ET.Element, tpl: ET.Element,
     mpe = dev.find("MpePitchBendUsesTuning")
     if mpe is not None:
         mpe.set("Value", "true")
-    return True, f"{len(src_chunk)}B -> ProcessorState (wrapper kept, automation intact)"
+    note = f" (stripped {off}B prefix)" if off else ""
+    return True, (f"{len(src_chunk) - off}B -> ProcessorState{note} "
+                  f"(wrapper kept, automation intact)")
 
 
 def _port_au(new_dev: ET.Element, src_chunk: bytes, src_params: dict,
@@ -176,7 +199,46 @@ def _port_au(new_dev: ET.Element, src_chunk: bytes, src_params: dict,
         plist["AM_STATE"] = src_chunk[m:]
         set_au_plist(buf, plist)
         return True, f"AM_STATE {len(plist['AM_STATE'])}B"
-    return False, "unknown AU state layout (no vstdata/AM_STATE)"
+    if "jucePluginState" in plist:                 # JUCE copyXmlToBinary blob
+        if src_chunk[:4] != b"VC2!":
+            return False, "source chunk is not a JUCE VC2! blob"
+        plist["jucePluginState"] = src_chunk
+        set_au_plist(buf, plist)
+        return True, f"jucePluginState {len(src_chunk)}B"
+    return False, "unknown AU state layout (no vstdata/AM_STATE/jucePluginState)"
+
+
+def _automation_target_map(old_dev: ET.Element, new_dev: ET.Element,
+                           param_map: Optional[dict]) -> dict:
+    """Map old-device AutomationTarget ids -> new-device ids so envelopes can be
+    relinked when a device node is replaced. Matches the On switch directly and
+    parameters by name — exact, via param_map, or by prefix (VST2 truncates
+    parameter names to 15 chars; the AU exposes the full name)."""
+    m = {}
+    o_on = old_dev.find("./On/AutomationTarget")
+    n_on = new_dev.find("./On/AutomationTarget")
+    if o_on is not None and n_on is not None:
+        m[o_on.get("Id")] = n_on.get("Id")
+
+    def targets(d):
+        out = {}
+        for p in d.findall(".//ParameterList/"):
+            pn, at = p.find("ParameterName"), p.find(".//AutomationTarget")
+            if pn is not None and at is not None and pn.get("Value"):
+                out[pn.get("Value")] = at.get("Id")
+        return out
+
+    old_t, new_t = targets(old_dev), targets(new_dev)
+    inv = {v: k for k, v in (param_map or {}).items()}   # src name -> dest name
+    for oname, oid in old_t.items():
+        cands = [inv.get(oname), oname if oname in new_t else None]
+        if len(oname) >= 8:   # VST2 15-char truncation
+            cands += [n for n in new_t if n.startswith(oname)]
+        for c in cands:
+            if c and c in new_t:
+                m[oid] = new_t[c]
+                break
+    return m
 
 
 def _process_device(root: ET.Element, pmap: dict, dev: ET.Element,
@@ -208,11 +270,21 @@ def _process_device(root: ET.Element, pmap: dict, dev: ET.Element,
 
     old_defs = {x.get("Id") for x in dev.iter()
                 if "Id" in x.attrib and T.is_pointee_def(x.tag)}
+    tmap = _automation_target_map(dev, new_dev, spec.param_map)
     _replace_child(pmap[dev], dev, new_dev)
     pmap[new_dev] = pmap[dev]
 
-    orphans = sum(1 for x in root.iter()
-                  if x.tag == "PointeeId" and x.get("Value") in old_defs)
+    # relink automation envelopes that pointed at the old device
+    relinked = orphans = 0
+    for x in root.iter():
+        if x.tag == "PointeeId" and x.get("Value") in old_defs:
+            if x.get("Value") in tmap:
+                x.set("Value", tmap[x.get("Value")])
+                relinked += 1
+            else:
+                orphans += 1
+    if relinked:
+        detail += f"; relinked {relinked} automation env(s)"
     if orphans:
         detail += f"; WARNING: {orphans} automation ref(s) need manual relink"
     return Action(tname, spec.vst2_name, target, "ported", detail)
@@ -274,8 +346,12 @@ def recover_project(als_path: Path, specs, library_paths=None,
     tree = load_als(als_path)
     root = tree.getroot()
 
-    # tracks (incl. their nesting) that actually contain an affected device
-    tracks = [t for t in root.iter() if t.tag in ("AudioTrack", "MidiTrack")
+    # tracks (incl. their nesting) that actually contain an affected device.
+    # Group/Return/Main tracks host devices too (sends and master chains).
+    # MasterTrack is the pre-Live-12 name for MainTrack.
+    SCAN_TAGS = ("AudioTrack", "MidiTrack", "GroupTrack", "ReturnTrack",
+                 "MainTrack", "MasterTrack")
+    tracks = [t for t in root.iter() if t.tag in SCAN_TAGS
               if _affected_vst2_devices(t, names)]
     if not tracks:
         log("No affected VST2 devices found.")
@@ -300,11 +376,15 @@ def recover_project(als_path: Path, specs, library_paths=None,
 
     actions = []
     for track in tracks:
-        tname = track.find(".//Name/EffectiveName").get("Value")
-        if mode == "duplicate":
+        ne = track.find(".//Name/EffectiveName")
+        tname = (ne.get("Value") if ne is not None and ne.get("Value")
+                 else track.tag.replace("Track", ""))
+        if mode == "duplicate" and track.tag in ("AudioTrack", "MidiTrack"):
             work = T.duplicate_track(root, track, new_name=f"{tname} - COMPAT",
                                      mute=True)
         else:
+            # Group/Return/Main tracks can't be meaningfully duplicated —
+            # convert their devices in place even in duplicate mode.
             work = track
 
         pmap = _parent_map(work)

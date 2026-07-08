@@ -105,11 +105,20 @@ def harvest_templates(wanted: set, als_paths, cache_dir: Optional[Path] = None,
                 remaining.discard((name, fmt))
                 log(f"  template (cache): {name} [{fmt}]")
 
+    fmt_marker = {"VST3": b"Vst3PluginInfo", "AU": b"AuPluginInfo", "VST2": b"VstPluginInfo"}
     for path in als_paths:
         if not remaining:
             break
         try:
-            root = ET.fromstring(gzip.open(path, "rb").read())
+            data = gzip.open(path, "rb").read()
+        except Exception:
+            continue
+        # cheap prefilter: only ET-parse files that could contain a wanted device
+        if not any(name.encode() in data and fmt_marker[fmt] in data
+                   for (name, fmt) in remaining):
+            continue
+        try:
+            root = ET.fromstring(data)
         except Exception:
             continue
         for (name, fmt) in list(remaining):

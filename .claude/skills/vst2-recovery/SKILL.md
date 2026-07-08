@@ -96,12 +96,38 @@ named `.ens`, exact knob state is locked in NI's binary).
 
 | Target | State container | Method |
 |---|---|---|
-| VST3 | `<Vst3Preset><ProcessorState>` (hex) | Graft template's `PluginDesc` onto the existing device wrapper, copy the VST2 chunk in verbatim — only if the first 6 bytes (magic+version) match the template's (e.g. NI Transient Master ✓; Reaktor CSAR v5≠v6 ✗). Wrapper keeps `ParameterList`/`AutomationTarget`s → automation survives. |
+| VST3 | `<Vst3Preset><ProcessorState>` (hex) | Graft template's `PluginDesc` onto the existing device wrapper, then write the VST2 chunk at the alignment `_vst3_align` finds (see below). Wrapper keeps `ParameterList`/`AutomationTarget`s → automation survives. |
 | AU (soundhack-style) | `.aupreset` plist in `<AuPreset><Buffer>`, key `vstdata` = VST2 FXP | Rewrite the FXP float array (floats = normalised param values, in `ParameterList` order) from the old device's `Manual` values. |
 | AU (u-he-style) | plist key `AM_STATE` = text patch | Copy the old chunk's text from `#AM=` onward — identical across formats. |
+| AU (JUCE-style) | plist key `jucePluginState` | The VST2 chunk (JUCE `VC2!` + size + XML, from `copyXmlToBinary`) is wrapper-independent — copy it in whole. (Glitchmachines Hysteresis; any JUCE plugin.) |
 | AU (unknown layout) | — | Skipped with a report. To support a new vendor: dump the plist keys and find where state lives; add a branch in `recover._port_au`. |
 
+`_vst3_align` chunk-compat rules (vendor-verified): `VC2!` magic both sides →
+JUCE, port verbatim (soothe2); identical first-6-bytes → port verbatim (NI
+Transient Master ✓, Reaktor CSAR v5≠v6 correctly rejected); bytes 4–16 equal →
+size-prefixed both sides, port verbatim (Waves `TAPS`); VST2[4:12] or [8:16] ==
+VST3[0:8] → strip the prefix (iZotope DDLY). iZotope Ozone containers genuinely
+differ (VST2 and VST3 wrappers unrelated) → honest skip, manual recall.
+
+For AU replacements, automation envelopes pointing at the old device are
+relinked by matching the On switch and parameter names (exact, via `param_map`,
+or by prefix — VST2 truncates parameter names to 15 chars). Unmatched refs are
+reported for manual relinking.
+
 ## Hard-won gotchas
+
+- Devices live on **Group, Return and Main/Master tracks** too (sends, master
+  chains). `MasterTrack` is the pre-Live-12 tag; Live 12 says `MainTrack`. The
+  tool scans all of them; if you write ad-hoc scans, don't stop at Audio/Midi.
+- Ableton's missing-plugin warning under-reports — always trust `analyze` over
+  the screenshot (Moombah: screenshots showed 10 plugins, the file had 16).
+- **Waves** plugins live inside `WaveShell*.vst3/.component`, so the installed-
+  format check can't match them by name ("installed: NO" is cosmetic) — the
+  harvested template carries the correct shell identity and works regardless.
+- If no template exists anywhere in the library for a plugin (user never used
+  its AU/VST3 in a saved project), have the user make one throwaway set with
+  each missing plugin instantiated once, save it, and re-run — the harvester
+  picks them up from that file.
 
 - **Strip whitespace before unhexlifying** any Ableton hex buffer — Live 12
   wraps long `ProcessorState`/`Buffer` text with newlines/tabs.
