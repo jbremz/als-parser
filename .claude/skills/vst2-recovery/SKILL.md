@@ -99,8 +99,35 @@ named `.ens`, exact knob state is locked in NI's binary).
 | VST3 | `<Vst3Preset><ProcessorState>` (hex) | Graft template's `PluginDesc` onto the existing device wrapper, then write the VST2 chunk at the alignment `_vst3_align` finds (see below). Wrapper keeps `ParameterList`/`AutomationTarget`s → automation survives. |
 | AU (soundhack-style) | `.aupreset` plist in `<AuPreset><Buffer>`, key `vstdata` = VST2 FXP | Rewrite the FXP float array (floats = normalised param values, in `ParameterList` order) from the old device's `Manual` values. |
 | AU (u-he-style) | plist key `AM_STATE` = text patch | Copy the old chunk's text from `#AM=` onward — identical across formats. |
-| AU (JUCE-style) | plist key `jucePluginState` | The VST2 chunk (JUCE `VC2!` + size + XML, from `copyXmlToBinary`) is wrapper-independent — copy it in whole. (Glitchmachines Hysteresis; any JUCE plugin.) |
+| AU (JUCE-style) | plist key `jucePluginState` | The VST2 chunk is wrapper-independent — copy it in whole. Usually a `VC2!`+size+XML blob (`copyXmlToBinary`: Hysteresis, Roth-AIR, Spaceship Delay), but some plugins return raw bytes (Klevgrand Gaffel: bare float dump) — the port checks src and template agree on which class they are. |
+| AU (Soundtoys) | plist key `soundtoys-data` (a plist *string*) | Same `WIDGET = ...;` text as the VST2 chunk; normalise `\r` line endings to `\n` and strip trailing NULs. |
 | AU (unknown layout) | — | Skipped with a report. To support a new vendor: dump the plist keys and find where state lives; add a branch in `recover._port_au`. |
+
+## No template anywhere? Synthesize the device node
+
+When a plugin was never used as AU/VST3 in any saved project, you can build the
+AU device node without the user touching Ableton:
+
+1. Component identity codes are in
+   `/Library/Audio/Plug-Ins/Components/<X>.component/Contents/Info.plist`
+   (`AudioComponents` → type/subtype/manufacturer 4-char codes;
+   `struct.unpack(">I", code.encode())` gives the ints Ableton stores).
+   JUCE plugins reuse the VST2 UniqueId as the AU subtype — a good cross-check.
+2. Get the default `.aupreset` dict by instantiating the AU headless with
+   `tools/audump.c` (`clang -framework AudioToolbox -framework CoreFoundation
+   -o audump tools/audump.c`). It also prints the parameter table (JUCE AU
+   param ids are string *hashes*, not indices — never guess them). Some AUs
+   hang without a GUI session (Roth-AIR, Spaceship Delay did) — kill after
+   ~45s and fall back to a minimal dict in the vendor's known key pattern,
+   flagging the port as lower-confidence in your report.
+3. `device_templates.synthesize_au_device(donor, ...)` grafts the identity +
+   preset onto a real same-vendor device node and blanks the parameter list.
+   Write the result into the harvest cache (`~/.als_recover_cache/<norm>__AU.xml`)
+   and the normal `recover` run picks it up.
+
+Cross-format sanity check that unlocked Gaffel: its AU's default
+`jucePluginState` was 36 bytes — the exact size of the VST2 chunk — proving the
+state is the same raw blob on both sides.
 
 `_vst3_align` chunk-compat rules (vendor-verified): `VC2!` magic both sides →
 JUCE, port verbatim (soothe2); identical first-6-bytes → port verbatim (NI

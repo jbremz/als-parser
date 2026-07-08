@@ -81,6 +81,60 @@ def find_device_node(root: ET.Element, name: str, fmt: str) -> Optional[ET.Eleme
     return None
 
 
+def synthesize_au_device(donor: ET.Element, *, name: str, manufacturer: str,
+                         comp_type: int, comp_subtype: int, comp_manufacturer: int,
+                         preset_plist: dict) -> ET.Element:
+    """Build an AU device node for a plugin that was never used as an AU in any
+    saved project (so no real template exists to harvest).
+
+    *donor* is a real ``AuPluginDevice`` node from the same vendor/framework —
+    its wrapper structure is kept, but the component identity, stored preset
+    and parameter list are replaced. *preset_plist* should be the plugin's
+    default ``kAudioUnitProperty_ClassInfo`` dict (dump it with
+    ``tools/audump.c``), or, if the AU can't be instantiated headless, a
+    minimal dict following the vendor's known key layout — the state key's
+    value is overwritten during porting anyway.
+
+    The donor's parameter list is blanked (its names/ids belong to a different
+    plugin); Ableton re-queries parameters when it loads the AU.
+    """
+    import binascii as _ba
+    import plistlib as _pl
+
+    dev = copy.deepcopy(donor)
+    info = dev.find(".//AuPluginInfo")
+
+    def setv(parent, tag, val):
+        e = parent.find(tag)
+        if e is not None:
+            e.set("Value", str(val))
+
+    setv(info, "ComponentType", comp_type)
+    setv(info, "ComponentSubType", comp_subtype)
+    setv(info, "ComponentManufacturer", comp_manufacturer)
+    setv(info, "Name", name)
+    setv(info, "Manufacturer", manufacturer)
+
+    pre = info.find(".//AuPreset")
+    setv(pre, "Name", preset_plist.get("name", "Default"))
+    setv(pre, "Manufacturer", comp_manufacturer)
+    setv(pre, "SubType", comp_subtype)
+    setv(pre, "Type", comp_type)
+    buf = pre.find("Buffer")
+    buf.text = _ba.hexlify(_pl.dumps(preset_plist, fmt=_pl.FMT_XML)).decode().upper()
+    # drop the donor's preset-file pointer — it names the wrong plugin's cache
+    pr = pre.find("PresetRef")
+    if pr is not None:
+        for c in list(pr):
+            pr.remove(c)
+
+    for p in dev.findall(".//ParameterList/"):
+        setv(p, "ParameterName", "")
+        setv(p, "ParameterId", -1)
+        setv(p, "VisualIndex", 1073741823)
+    return dev
+
+
 def harvest_templates(wanted: set, als_paths, cache_dir: Optional[Path] = None,
                       log=print) -> dict:
     """Find a clean device template for each (name, fmt) in *wanted*.
@@ -113,9 +167,15 @@ def harvest_templates(wanted: set, als_paths, cache_dir: Optional[Path] = None,
             data = gzip.open(path, "rb").read()
         except Exception:
             continue
-        # cheap prefilter: only ET-parse files that could contain a wanted device
-        if not any(name.encode() in data and fmt_marker[fmt] in data
-                   for (name, fmt) in remaining):
+        # cheap prefilter: only ET-parse files that could contain a wanted
+        # device. Match on word fragments, not the exact name — the same
+        # plugin's display name can differ per format ("LittleAlterBoy" VST2
+        # vs "Little AlterBoy" AU).
+        def _maybe_has(name, fmt):
+            frags = re.findall(r"[A-Za-z0-9]{3,}", name) or [name]
+            return (fmt_marker[fmt] in data
+                    and all(f.encode() in data for f in frags))
+        if not any(_maybe_has(name, fmt) for (name, fmt) in remaining):
             continue
         try:
             root = ET.fromstring(data)

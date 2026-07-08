@@ -199,13 +199,28 @@ def _port_au(new_dev: ET.Element, src_chunk: bytes, src_params: dict,
         plist["AM_STATE"] = src_chunk[m:]
         set_au_plist(buf, plist)
         return True, f"AM_STATE {len(plist['AM_STATE'])}B"
-    if "jucePluginState" in plist:                 # JUCE copyXmlToBinary blob
-        if src_chunk[:4] != b"VC2!":
-            return False, "source chunk is not a JUCE VC2! blob"
+    if "soundtoys-data" in plist:                  # Soundtoys WIDGET text
+        if not src_chunk.startswith(b"WIDGET"):
+            return False, "source chunk is not Soundtoys WIDGET text"
+        text = (src_chunk.decode("latin-1").rstrip("\x00")
+                .replace("\r\n", "\n").replace("\r", "\n"))
+        plist["soundtoys-data"] = text
+        set_au_plist(buf, plist)
+        return True, f"soundtoys-data {len(text)}B"
+    if "jucePluginState" in plist:
+        # JUCE getStateInformation output. Usually a VC2!-wrapped XML blob
+        # (copyXmlToBinary), but some plugins return raw bytes (Klevgrand
+        # Gaffel: a bare float dump). Either way the same blob is stored on
+        # both the VST2 and AU sides — port it if src and template agree on
+        # which class they are.
+        tpl_state = plist["jucePluginState"] or b""
+        if (src_chunk[:4] == b"VC2!") != (tpl_state[:4] == b"VC2!"):
+            return False, "source/template jucePluginState formats differ"
         plist["jucePluginState"] = src_chunk
         set_au_plist(buf, plist)
         return True, f"jucePluginState {len(src_chunk)}B"
-    return False, "unknown AU state layout (no vstdata/AM_STATE/jucePluginState)"
+    return False, ("unknown AU state layout "
+                   "(no vstdata/AM_STATE/soundtoys-data/jucePluginState)")
 
 
 def _automation_target_map(old_dev: ET.Element, new_dev: ET.Element,
@@ -242,21 +257,28 @@ def _automation_target_map(old_dev: ET.Element, new_dev: ET.Element,
 
 
 def _process_device(root: ET.Element, pmap: dict, dev: ET.Element,
-                    spec: "PluginSpec", tpl: ET.Element, tname: str) -> Action:
+                    spec: "PluginSpec", tpl: ET.Element, tname: str,
+                    exports: Optional[list] = None) -> Action:
     """Convert one dead VST2 device according to *spec*. Mutates the tree.
 
-    On failure the device is left untouched (dead but data-intact) and the
-    action carries a manual-recall hint extracted from the chunk.
+    On failure the device is left untouched (dead but data-intact), the action
+    carries a manual-recall hint extracted from the chunk, and the chunk is
+    added to *exports* so it can be written out as a recovery artifact.
     """
     src_chunk = vst2_chunk(dev)
     target = f"{spec.target_name} [{spec.target_fmt}]"
 
+    def skipped(detail):
+        refs = _extract_refs(src_chunk)
+        if exports is not None:
+            exports.append((tname, spec.vst2_name, src_chunk))
+        return Action(tname, spec.vst2_name, target, "skipped",
+                      detail + (f"; recall: {refs}" if refs else ""))
+
     if spec.target_fmt == "VST3":
         ok, detail = _convert_vst3_inplace(root, dev, tpl, src_chunk)
         if not ok:
-            refs = _extract_refs(src_chunk)
-            return Action(tname, spec.vst2_name, target, "skipped",
-                          detail + (f"; recall: {refs}" if refs else ""))
+            return skipped(detail)
         return Action(tname, spec.vst2_name, target, "ported", detail)
 
     # AU: tag + parameter space differ, so the whole node is replaced
@@ -264,9 +286,7 @@ def _process_device(root: ET.Element, pmap: dict, dev: ET.Element,
     T.remap_pointee_ids(root, new_dev)
     ok, detail = _port_au(new_dev, src_chunk, param_values(dev), spec.param_map)
     if not ok:
-        refs = _extract_refs(src_chunk)
-        return Action(tname, spec.vst2_name, target, "skipped",
-                      detail + (f"; recall: {refs}" if refs else ""))
+        return skipped(detail)
 
     old_defs = {x.get("Id") for x in dev.iter()
                 if "Id" in x.attrib and T.is_pointee_def(x.tag)}
@@ -375,6 +395,7 @@ def recover_project(als_path: Path, specs, library_paths=None,
             f"project (or pass its library path) and re-run.")
 
     actions = []
+    exports = []
     for track in tracks:
         ne = track.find(".//Name/EffectiveName")
         tname = (ne.get("Value") if ne is not None and ne.get("Value")
@@ -392,11 +413,12 @@ def recover_project(als_path: Path, specs, library_paths=None,
             spec = specs_by_name[_device_name(dev)]
             tpl = templates.get((spec.target_name, spec.target_fmt))
             if tpl is None:
+                exports.append((tname, spec.vst2_name, vst2_chunk(dev)))
                 actions.append(Action(
                     tname, spec.vst2_name, f"{spec.target_name} [{spec.target_fmt}]",
                     "skipped", "no device template"))
                 continue
-            actions.append(_process_device(root, pmap, dev, spec, tpl, tname))
+            actions.append(_process_device(root, pmap, dev, spec, tpl, tname, exports))
 
     # report
     log("\nActions:")
@@ -412,6 +434,16 @@ def recover_project(als_path: Path, specs, library_paths=None,
     log("\nXML re-parse: OK")
 
     if apply:
+        if exports:
+            # skipped devices keep their dead VST2 in the file, but also export
+            # the raw chunks as artifacts for out-of-band recovery
+            rec_dir = (out_path or als_path).parent / "_RECOVERY"
+            rec_dir.mkdir(exist_ok=True)
+            import re as _re
+            for tname, plugin, chunk in exports:
+                safe = _re.sub(r"[^\w\- ]", "_", f"{plugin} - {tname}")[:80]
+                (rec_dir / f"{safe}.vst2chunk").write_bytes(chunk)
+            log(f"Exported {len(exports)} skipped chunk(s) to {rec_dir}")
         if mode == "inplace":
             save_als(tree, out_path)
             log(f"Wrote {out_path}  (original untouched)")
