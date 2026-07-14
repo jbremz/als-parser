@@ -100,6 +100,36 @@ def _extract_refs(chunk: bytes) -> str:
     return ", ".join(hits[:3])
 
 
+def chunk_report(chunk: bytes) -> str:
+    """Human-readable forensics for an unportable chunk: file references,
+    ASCII and UTF-16 strings (snapshot/preset names, tags, authors). Written
+    as a sidecar next to each exported .vst2chunk."""
+    import re
+    lines = [f"chunk size: {len(chunk)} bytes",
+             f"container head: {chunk[:16]!r}", ""]
+    asc = [s.decode("latin-1") for s in re.findall(rb"[ -~]{5,}", chunk)]
+    paths = [s for s in asc if "file:" in s or "/" in s and "." in s]
+    if paths:
+        lines.append("file references:")
+        lines += [f"  {p}" for p in dict.fromkeys(paths)][:40]
+    u16 = [s.decode("utf-16-le")
+           for s in re.findall(rb"(?:[\x20-\x7e]\x00){4,}", chunk)]
+    names = [s for s in dict.fromkeys(u16)
+             if not s.startswith("\\@") and len(s) < 60]
+    if names:
+        lines.append("")
+        lines.append("embedded names/tags (snapshot & preset names often here):")
+        lines += [f"  {s}" for s in names[:40]]
+    other = [s for s in dict.fromkeys(asc)
+             if s not in paths and not re.fullmatch(r"[A-Za-z0-9+/=]{8,}", s)
+             and len(s) < 60][:25]
+    if other:
+        lines.append("")
+        lines.append("other readable strings:")
+        lines += [f"  {s}" for s in other]
+    return "\n".join(lines) + "\n"
+
+
 def _vst3_align(src: bytes, template_state_hex: str) -> Optional[int]:
     """Decide whether a VST2 chunk can be ported into a VST3 ProcessorState, and
     at what byte offset. Returns the number of prefix bytes to strip from the
@@ -483,6 +513,7 @@ def recover_project(als_path: Path, specs, library_paths=None,
             for tname, plugin, chunk in exports:
                 safe = _re.sub(r"[^\w\- ]", "_", f"{plugin} - {tname}")[:80]
                 (rec_dir / f"{safe}.vst2chunk").write_bytes(chunk)
+                (rec_dir / f"{safe}.txt").write_text(chunk_report(chunk))
             log(f"Exported {len(exports)} skipped chunk(s) to {rec_dir}")
         if mode == "inplace":
             save_als(tree, out_path)
