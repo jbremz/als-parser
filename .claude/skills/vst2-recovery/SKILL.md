@@ -143,7 +143,16 @@ AU device node without the user touching Ableton:
    preset onto a real same-vendor device node and blanks the parameter list.
    Write the result into the harvest cache (`~/.als_recover_cache/<norm>__AU.xml`)
    and the normal `recover` run picks it up.
-4. Before injecting a legacy/cross-version state into a plugin, **pre-screen
+4. **On Apple Silicon, "dead" usually means "Intel-only", not dead.** Before
+   declaring a plugin unrecoverable, check the binary arch (`file`) and
+   re-validate under Rosetta: `arch -x86_64 auval -v TYPE SUBT MANU`.
+   (SubBoomBass v1 "FATAL error" natively — full PASS under x86_64.) The
+   bit-exact recovery fallback for any x86_64 VST2: set Ableton Live to
+   "Open using Rosetta" (Get Info), open the ORIGINAL project — VST2 support
+   comes back and every device loads its exact state — freeze/flatten the
+   affected tracks, save-as, return to native Live. This is why originals
+   must never be modified: they are the Rosetta-recoverable ground truth.
+5. Before injecting a legacy/cross-version state into a plugin, **pre-screen
    headless** with `audump ... out.plist --set crafted.plist` — it sets
    ClassInfo before dumping, so the plugin's own validation runs without a
    DAW. (SubBoomBass 2 printed "Fatal error, preset Size wrong!" and reverted
