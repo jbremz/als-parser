@@ -92,6 +92,13 @@ named `.ens`, exact knob state is locked in NI's binary).
   Id unique among ALL its siblings (`_unique_sibling_id`), not just its tag.
   If you touched library code, also re-check byte equality of a ported chunk
   vs its source.
+- **Era mixing corrupts files**: templates harvested from pre-Live-11 projects
+  carry old-style FileRefs (`RelativePath` with `RelativePathElement` children,
+  no Value attribute) inside LastPresetRef/PresetRef; Live 12 refuses the file
+  ("Required attribute 'Value' missing"). Grafted nodes are sanitised
+  (`_strip_preset_refs` — these are cosmetic browser pointers) and the writer
+  gates on the document's `RelativePathElement` count not growing. ET can't
+  catch this — it's schema-valid XML, wrong era.
 - Ask the user to open the result in Ableton. Ground truth after they save:
   every replacement device should show `IsPlaceholderDevice=false` (and AU:
   `IsUnusable=false`) in the re-saved file.

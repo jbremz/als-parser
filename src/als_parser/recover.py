@@ -255,12 +255,15 @@ def _convert_vst3_inplace(root: ET.Element, dev: ET.Element, tpl: ET.Element,
         note = f" (stripped {off}B prefix)" if off else ""
     new_pd = copy.deepcopy(tpl.find("PluginDesc"))
     T.remap_pointee_ids(root, new_pd)
+    _strip_preset_refs(new_pd)
     new_pd.find(".//Vst3Preset/ProcessorState").text = _hex(new_state)
     _replace_child(dev, dev.find("PluginDesc"), new_pd)
 
     old_sc, tpl_sc = dev.find("SourceContext"), tpl.find("SourceContext")
     if old_sc is not None and tpl_sc is not None:
-        _replace_child(dev, old_sc, copy.deepcopy(tpl_sc))
+        new_sc = copy.deepcopy(tpl_sc)
+        _strip_preset_refs(new_sc)
+        _replace_child(dev, old_sc, new_sc)
 
     mpe = dev.find("MpePitchBendUsesTuning")
     if mpe is not None:
@@ -343,6 +346,25 @@ def _port_au(new_dev: ET.Element, src_chunk: bytes, src_params: dict,
                    "soundtoys-data/jucePluginState/mCompleteData)")
 
 
+def _strip_preset_refs(node: ET.Element) -> None:
+    """Clear preset-file pointers in a grafted template node.
+
+    Templates harvested from pre-Live-11 projects carry old-style FileRefs
+    (``RelativePath`` containing ``RelativePathElement`` children, no Value
+    attribute) inside LastPresetRef / PresetRef. Live 12 refuses to load them
+    ("Required attribute 'Value' missing"). These are cosmetic browser
+    pointers, not plugin state — reduce them to the modern empty forms:
+    ``<LastPresetRef><Value /></LastPresetRef>`` and ``<PresetRef />``.
+    """
+    for lpr in node.iter("LastPresetRef"):
+        for c in list(lpr):
+            lpr.remove(c)
+        ET.SubElement(lpr, "Value")
+    for pr in node.iter("PresetRef"):
+        for c in list(pr):
+            pr.remove(c)
+
+
 def _automation_target_map(old_dev: ET.Element, new_dev: ET.Element,
                            param_map: Optional[dict]) -> dict:
     """Map old-device AutomationTarget ids -> new-device ids so envelopes can be
@@ -404,6 +426,7 @@ def _process_device(root: ET.Element, pmap: dict, dev: ET.Element,
     # AU: tag + parameter space differ, so the whole node is replaced
     new_dev = copy.deepcopy(tpl)
     T.remap_pointee_ids(root, new_dev)
+    _strip_preset_refs(new_dev)
     prog_e = dev.find(".//VstPreset/ProgramNumber")
     program = int(prog_e.get("Value")) if prog_e is not None and prog_e.get("Value") else None
     ok, detail = _port_au(new_dev, src_chunk, param_values(dev), spec.param_map,
@@ -489,6 +512,7 @@ def recover_project(als_path: Path, specs, library_paths=None,
 
     tree = load_als(als_path)
     root = tree.getroot()
+    baseline_legacy = sum(1 for _ in root.iter("RelativePathElement"))
 
     # tracks (incl. their nesting) that actually contain an affected device.
     # Group/Return/Main tracks host devices too (sends and master chains).
@@ -562,7 +586,15 @@ def recover_project(als_path: Path, specs, library_paths=None,
             log(f"  ID COLLISION in <{ptag}>: Id={v} shared by {tags}")
         raise RuntimeError(
             f"{len(collisions)} sibling-id collision(s) — refusing to write")
-    log("\nXML re-parse: OK; sibling ids unique")
+    # era gate: grafted templates from pre-Live-11 projects carry old-style
+    # path serialisation (RelativePathElement) that Live 12 refuses to load.
+    # We never add any — if the count grew, a graft wasn't sanitised.
+    n_legacy = sum(1 for _ in root.iter("RelativePathElement"))
+    if n_legacy > baseline_legacy:
+        raise RuntimeError(
+            f"legacy RelativePathElement count grew {baseline_legacy} -> "
+            f"{n_legacy} — unsanitised old-era template; refusing to write")
+    log("\nXML re-parse: OK; sibling ids unique; no legacy path elements added")
 
     if apply:
         if exports:
