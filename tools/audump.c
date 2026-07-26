@@ -42,6 +42,28 @@ int main(int argc, char **argv) {
     err = AudioUnitInitialize(au);
     if (err) fprintf(stderr, "warning: init failed (%d), continuing\n", (int)err);
 
+    /* optional: audump TYPE SUB MANU out.plist --set in.plist
+     * Sets ClassInfo from in.plist BEFORE dumping — lets us test whether a
+     * plugin accepts a crafted/legacy state without opening a DAW. */
+    if (argc > 6 && strcmp(argv[5], "--set") == 0) {
+        FILE *f = fopen(argv[6], "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+            void *buf = malloc((size_t)n);
+            fread(buf, 1, (size_t)n, f); fclose(f);
+            CFDataRef dat = CFDataCreate(NULL, buf, n);
+            CFPropertyListRef in = CFPropertyListCreateWithData(NULL, dat, 0, NULL, NULL);
+            if (in) {
+                OSStatus serr = AudioUnitSetProperty(au, kAudioUnitProperty_ClassInfo,
+                    kAudioUnitScope_Global, 0, &in, sizeof(in));
+                printf("SET_CLASSINFO result: %d\n", (int)serr);
+            } else {
+                printf("SET_CLASSINFO result: (plist parse failed)\n");
+            }
+            free(buf);
+        }
+    }
+
     if (argc > 4) {
         CFPropertyListRef pl = NULL;
         UInt32 sz = sizeof(pl);

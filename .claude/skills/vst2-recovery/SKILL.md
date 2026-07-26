@@ -143,6 +143,15 @@ AU device node without the user touching Ableton:
    preset onto a real same-vendor device node and blanks the parameter list.
    Write the result into the harvest cache (`~/.als_recover_cache/<norm>__AU.xml`)
    and the normal `recover` run picks it up.
+4. Before injecting a legacy/cross-version state into a plugin, **pre-screen
+   headless** with `audump ... out.plist --set crafted.plist` — it sets
+   ClassInfo before dumping, so the plugin's own validation runs without a
+   DAW. (SubBoomBass 2 printed "Fatal error, preset Size wrong!" and reverted
+   to defaults when fed a v1 bank — proving v1→v2 injection is impossible
+   before anyone wasted money or an Ableton session on it.) Successor-version
+   plugins usually can NOT read predecessor state; verify, never assume. A
+   dead v1 plugin's presets can still be exported as .fxp/.fxb (forge the
+   FxCk/FxBk container) for use in any working v1 instance elsewhere.
 
 Cross-format sanity check that unlocked Gaffel: its AU's default
 `jucePluginState` was 36 bytes — the exact size of the VST2 chunk — proving the
