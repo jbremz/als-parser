@@ -168,7 +168,31 @@ def _vst3_align(src: bytes, template_state_hex: str) -> Optional[int]:
     for off in (4, 8):
         if len(src) > off + 8 and src[off:off + 8] == tpl[:8]:
             return off
+    if _izotope_rewrap(src, tpl) is not None:
+        return "izotope"
     return None
+
+
+def _izotope_rewrap(src: bytes, tpl: bytes) -> Optional[bytes]:
+    """iZotope (Ozone-era) state: a zlib blob of a JSON 'Context State' dict.
+    VST2 wraps it in an old 20-byte header; AU/VST3 use
+    ``<u32 magic><u32 version><u32 zlib_len+4><u32 raw_len>`` + zlib (verified
+    empirically: both sides decompress to the identical JSON). Rebuild the
+    modern wrapper (magic/version copied from the template) around the VST2
+    chunk's own zlib payload. Returns None if either side isn't this shape."""
+    import struct as _st
+    import zlib as _zl
+    if len(tpl) < 18 or tpl[16:18] != b"\x78\x9c":
+        return None
+    off = src.find(b"\x78\x9c", 0, 64)
+    if off < 0:
+        return None
+    try:
+        raw_len = len(_zl.decompress(src[off:]))
+    except _zl.error:
+        return None
+    payload = src[off:]
+    return tpl[:8] + _st.pack("<II", len(payload) + 4, raw_len) + payload
 
 
 def _wrap_vstw(tpl_state: bytes, src_chunk: bytes) -> Optional[bytes]:
@@ -253,6 +277,9 @@ def _convert_vst3_inplace(root: ET.Element, dev: ET.Element, tpl: ET.Element,
     if off == "vstw":
         new_state = _wrap_vstw(tpl_bytes, src_chunk)
         note = " (VstW-wrapped)"
+    elif off == "izotope":
+        new_state = _izotope_rewrap(src_chunk, tpl_bytes)
+        note = " (iZotope zlib rewrap)"
     else:
         new_state = src_chunk[off:]
         note = f" (stripped {off}B prefix)" if off else ""
@@ -271,6 +298,7 @@ def _convert_vst3_inplace(root: ET.Element, dev: ET.Element, tpl: ET.Element,
     mpe = dev.find("MpePitchBendUsesTuning")
     if mpe is not None:
         mpe.set("Value", "true")
+    _carry_on_state(dev, dev)   # grafted Vst3Preset IsOn follows the wrapper
     return True, (f"{len(new_state)}B -> ProcessorState{note} "
                   f"(wrapper kept, automation intact)")
 
@@ -345,8 +373,29 @@ def _port_au(new_dev: ET.Element, src_chunk: bytes, src_params: dict,
         plist["jucePluginState"] = src_chunk
         set_au_plist(buf, plist)
         return True, f"jucePluginState {len(src_chunk)}B"
+    state_keys = set(plist) - {"manufacturer", "subtype", "type", "version",
+                               "name", "ProgramNumber", "element-name",
+                               "mCurPreset", "data"}
+    if "data" in plist and not state_keys:
+        # iZotope-style AU: the whole state lives in the standard 'data' key
+        # as the same stream the plugin's VST3 uses. Reuse the VST3 alignment
+        # rules against the template's default data.
+        tpl_data = plist["data"] or b""
+        off = _vst3_align(src_chunk, binascii.hexlify(tpl_data).decode())
+        if off is None:
+            return False, "AU 'data' stream format differs from VST2 chunk"
+        if off == "izotope":
+            plist["data"] = _izotope_rewrap(src_chunk, tpl_data)
+            note = "iZotope zlib rewrap"
+        elif off == "vstw":
+            return False, "unexpected VstW template in AU data"
+        else:
+            plist["data"] = src_chunk[off:]
+            note = f"stripped {off}B prefix" if off else "verbatim"
+        set_au_plist(buf, plist)
+        return True, f"AU data {len(plist['data'])}B ({note})"
     return False, ("unknown AU state layout (no vstdata/AM_STATE/"
-                   "soundtoys-data/jucePluginState/mCompleteData)")
+                   "soundtoys-data/jucePluginState/mCompleteData/data)")
 
 
 def _strip_preset_refs(node: ET.Element) -> None:
@@ -392,6 +441,10 @@ def _automation_target_map(old_dev: ET.Element, new_dev: ET.Element,
     inv = {v: k for k, v in (param_map or {}).items()}   # src name -> dest name
     for oname, oid in old_t.items():
         cands = [inv.get(oname), oname if oname in new_t else None]
+        if ": " in oname:
+            # u-he style: VST2 prefixes names with the product ("Tyrell: Tune2")
+            # while the AU exposes the bare name ("Tune2")
+            cands.append(oname.split(": ", 1)[1])
         if len(oname) >= 8:   # VST2 15-char truncation
             cands += [n for n in new_t if n.startswith(oname)]
         for c in cands:
@@ -399,6 +452,22 @@ def _automation_target_map(old_dev: ET.Element, new_dev: ET.Element,
                 m[oid] = new_t[c]
                 break
     return m
+
+
+def _carry_on_state(old_dev: ET.Element, new_dev: ET.Element) -> None:
+    """Copy the device activator (On switch) from the old device to its
+    replacement. Replacement nodes are cloned from templates whose donor may
+    have been switched off in its source project — without this, ported
+    devices arrive deactivated."""
+    src = old_dev.find("./On/Manual")
+    val = src.get("Value") if src is not None else "true"
+    dst = new_dev.find("./On/Manual")
+    if dst is not None:
+        dst.set("Value", val)
+    for tag in ("AuPreset", "Vst3Preset"):
+        ison = new_dev.find(f".//{tag}/IsOn")
+        if ison is not None:
+            ison.set("Value", val)
 
 
 def _process_device(root: ET.Element, pmap: dict, dev: ET.Element,
@@ -436,7 +505,9 @@ def _process_device(root: ET.Element, pmap: dict, dev: ET.Element,
             mpe = dev.find("MpePitchBendUsesTuning")
             if mpe is not None:
                 mpe.set("Value", "true")
+            _carry_on_state(dev, dev)
         else:
+            _carry_on_state(dev, new_dev)
             _replace_child(pmap[dev], dev, new_dev)
             pmap[new_dev] = pmap[dev]
             _unique_sibling_id(pmap[new_dev], new_dev)
@@ -466,6 +537,7 @@ def _process_device(root: ET.Element, pmap: dict, dev: ET.Element,
     old_defs = {x.get("Id") for x in dev.iter()
                 if "Id" in x.attrib and T.is_pointee_def(x.tag)}
     tmap = _automation_target_map(dev, new_dev, spec.param_map)
+    _carry_on_state(dev, new_dev)
     _replace_child(pmap[dev], dev, new_dev)
     pmap[new_dev] = pmap[dev]
     _unique_sibling_id(pmap[new_dev], new_dev)
