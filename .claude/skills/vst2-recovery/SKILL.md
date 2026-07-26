@@ -105,7 +105,15 @@ named `.ens`, exact knob state is locked in NI's binary).
 | AU (u-he-style) | plist key `AM_STATE` = text patch | Copy the old chunk's text from `#AM=` onward — identical across formats. |
 | AU (JUCE-style) | plist key `jucePluginState` | The VST2 chunk is wrapper-independent — copy it in whole. Usually a `VC2!`+size+XML blob (`copyXmlToBinary`: Hysteresis, Roth-AIR, Spaceship Delay), but some plugins return raw bytes (Klevgrand Gaffel: bare float dump) — the port checks src and template agree on which class they are. |
 | AU (Soundtoys) | plist key `soundtoys-data` (a plist *string*) | Same `WIDGET = ...;` text as the VST2 chunk; normalise `\r` line endings to `\n` and strip trailing NULs. |
+| AU (Rob Papen) | plist key `mCompleteData` (+ `mCurPreset`) | The whole VST2 bank blob verbatim; set `mCurPreset` from the Ableton device's `VstPreset/ProgramNumber`. |
+| AU (FPCh-style, e.g. KV331 SynthMasterCM) | plist key `vstdata` = `CcnK/FPCh` | An opaque-chunk VST2 preset container; rebuild the 60-byte header around the raw VST2 chunk (`_rebuild_fpch`). |
 | AU (unknown layout) | — | Skipped with a report. To support a new vendor: dump the plist keys and find where state lives; add a branch in `recover._port_au`. |
+
+VST3 bonus rule — **`VstW` wrapper**: some VST3s (ValhallaRoom) store their
+state as Steinberg's VST2-compat container `VstW`(16B) + `CcnK/FBCh` (bank,
+160B header) or `/FPCh` + the raw VST2 chunk. If a harvested VST3 template
+starts `VstW`, port by rebuilding that wrapper around the old chunk
+(`_wrap_vstw`) — class-checked against the template's inner chunk.
 
 ## No template anywhere? Synthesize the device node
 
@@ -159,6 +167,23 @@ reported for manual relinking.
   its AU/VST3 in a saved project), have the user make one throwaway set with
   each missing plugin instantiated once, save it, and re-run — the harvester
   picks them up from that file.
+- When synthesizing a soundhack-style (`vstdata` FxCk) template, the param
+  table must be written into **PluginFloatParameter entries only** — the FXP
+  port maps name→slot via `param_order()`, which reads float entries; filling
+  mixed float/enum donor entries misaligns the mapping (symptom: "FXP: N
+  params" with N < the plugin's param count).
+- The installed-plugin name can differ from the VST2 name in surprising ways:
+  CumulusVST → Loomer "Cumulus", DeClick2 → "Acon Digital DeClick 2",
+  RP-Distort → RP-Distort_64.component. When `analyze` says "no replacement
+  found", check the AU registry before believing it — enumerate ALL registered
+  AUs (with codes) via a tiny AudioComponentFindNext loop rather than
+  `auval -a`, which can hang for 10+ minutes.
+- Instruments (`aumu`) need an instrument donor node for synthesis (e.g. a
+  u-he BazilleCM device), not an effect node.
+- Ableton's `Log.txt` (~/Library/Preferences/Ableton/Live x/) is the ground
+  truth for "components errored on open" reports: dead VST2s show as
+  "VST2: Restore N failed: <name>"; missing samples and AU failures are
+  logged distinctly.
 
 - **Strip whitespace before unhexlifying** any Ableton hex buffer — Live 12
   wraps long `ProcessorState`/`Buffer` text with newlines/tabs.

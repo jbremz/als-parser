@@ -83,7 +83,7 @@ def find_device_node(root: ET.Element, name: str, fmt: str) -> Optional[ET.Eleme
 
 def synthesize_au_device(donor: ET.Element, *, name: str, manufacturer: str,
                          comp_type: int, comp_subtype: int, comp_manufacturer: int,
-                         preset_plist: dict) -> ET.Element:
+                         preset_plist: dict, params: Optional[list] = None) -> ET.Element:
     """Build an AU device node for a plugin that was never used as an AU in any
     saved project (so no real template exists to harvest).
 
@@ -96,7 +96,10 @@ def synthesize_au_device(donor: ET.Element, *, name: str, manufacturer: str,
     value is overwritten during porting anyway.
 
     The donor's parameter list is blanked (its names/ids belong to a different
-    plugin); Ableton re-queries parameters when it loads the AU.
+    plugin); Ableton re-queries parameters when it loads the AU. Pass *params*
+    — a list of ``(au_param_id, name)`` from ``tools/audump.c`` — to populate
+    real entries instead: required when porting will rewrite an FXP by
+    parameter name (soundhack), and it enables automation relinking.
     """
     import binascii as _ba
     import plistlib as _pl
@@ -128,10 +131,25 @@ def synthesize_au_device(donor: ET.Element, *, name: str, manufacturer: str,
         for c in list(pr):
             pr.remove(c)
 
+    # Fill only PluginFloatParameter entries with the real params — that is
+    # the entry type param_order()/the FXP port reads, so mixing in the
+    # donor's enum entries would misalign the name<->slot mapping.
+    floats = dev.findall(".//ParameterList/PluginFloatParameter")
+    for i, p in enumerate(floats):
+        if params and i < len(params):
+            pid, pname = params[i]
+            setv(p, "ParameterName", pname)
+            setv(p, "ParameterId", pid)
+            setv(p, "VisualIndex", i)
+        else:
+            setv(p, "ParameterName", "")
+            setv(p, "ParameterId", -1)
+            setv(p, "VisualIndex", 1073741823)
     for p in dev.findall(".//ParameterList/"):
-        setv(p, "ParameterName", "")
-        setv(p, "ParameterId", -1)
-        setv(p, "VisualIndex", 1073741823)
+        if p.tag != "PluginFloatParameter":
+            setv(p, "ParameterName", "")
+            setv(p, "ParameterId", -1)
+            setv(p, "VisualIndex", 1073741823)
     return dev
 
 

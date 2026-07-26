@@ -152,6 +152,10 @@ def _vst3_align(src: bytes, template_state_hex: str) -> Optional[int]:
         tpl = binascii.unhexlify("".join(template_state_hex.split()))
     except binascii.Error:
         return None
+    if tpl[:4] == b"VstW":
+        # Steinberg's VST2-compat preset wrapper: the VST3 accepts its old VST2
+        # chunk wrapped as VstW + CcnK(FBCh/FPCh). Rebuildable around src.
+        return "vstw" if _wrap_vstw(tpl, src) is not None else None
     if src[:4] == b"VC2!" and tpl[:4] == b"VC2!":
         return 0
     if src[:6] == tpl[:6]:
@@ -162,6 +166,28 @@ def _vst3_align(src: bytes, template_state_hex: str) -> Optional[int]:
         if len(src) > off + 8 and src[off:off + 8] == tpl[:8]:
             return off
     return None
+
+
+def _wrap_vstw(tpl_state: bytes, src_chunk: bytes) -> Optional[bytes]:
+    """Rebuild a VstW-wrapped VST2 bank/preset container around *src_chunk*,
+    copying the template's headers. Layout: VstW(16B) + CcnK + 'FBCh' (bank,
+    v2: 160B header, chunkSize at [172:176]) or 'FPCh' (preset: 60B header,
+    chunkSize at [72:76]) + chunk. Returns None if the template isn't this
+    shape or the inner chunk class doesn't match the source's."""
+    import struct as _st
+    if tpl_state[:4] != b"VstW" or tpl_state[16:20] != b"CcnK":
+        return None
+    kind = tpl_state[24:28]
+    hdr_end = {b"FBCh": 176, b"FPCh": 76}.get(kind)
+    if hdr_end is None or len(tpl_state) < hdr_end:
+        return None
+    tpl_inner = tpl_state[hdr_end:]
+    if (src_chunk[:4] == b"VC2!") != (tpl_inner[:4] == b"VC2!"):
+        return None
+    head = bytearray(tpl_state[:hdr_end])
+    _st.pack_into(">I", head, hdr_end - 4, len(src_chunk))          # chunkSize
+    _st.pack_into(">I", head, 20, hdr_end - 24 + len(src_chunk))    # CcnK byteSize
+    return bytes(head) + src_chunk
 
 
 def _replace_child(parent: ET.Element, old: ET.Element, new: ET.Element) -> None:
@@ -220,9 +246,16 @@ def _convert_vst3_inplace(root: ET.Element, dev: ET.Element, tpl: ET.Element,
     if off is None:
         return False, "VST2/VST3 chunk formats differ (needs manual recall)"
 
+    tpl_bytes = binascii.unhexlify("".join((tpl_ps.text or "").split()))
+    if off == "vstw":
+        new_state = _wrap_vstw(tpl_bytes, src_chunk)
+        note = " (VstW-wrapped)"
+    else:
+        new_state = src_chunk[off:]
+        note = f" (stripped {off}B prefix)" if off else ""
     new_pd = copy.deepcopy(tpl.find("PluginDesc"))
     T.remap_pointee_ids(root, new_pd)
-    new_pd.find(".//Vst3Preset/ProcessorState").text = _hex(src_chunk[off:])
+    new_pd.find(".//Vst3Preset/ProcessorState").text = _hex(new_state)
     _replace_child(dev, dev.find("PluginDesc"), new_pd)
 
     old_sc, tpl_sc = dev.find("SourceContext"), tpl.find("SourceContext")
@@ -232,16 +265,32 @@ def _convert_vst3_inplace(root: ET.Element, dev: ET.Element, tpl: ET.Element,
     mpe = dev.find("MpePitchBendUsesTuning")
     if mpe is not None:
         mpe.set("Value", "true")
-    note = f" (stripped {off}B prefix)" if off else ""
-    return True, (f"{len(src_chunk) - off}B -> ProcessorState{note} "
+    return True, (f"{len(new_state)}B -> ProcessorState{note} "
                   f"(wrapper kept, automation intact)")
 
 
+def _rebuild_fpch(template_fxp: bytes, chunk: bytes) -> bytes:
+    """Rebuild a CcnK/FPCh (opaque-chunk preset) container around *chunk*,
+    keeping the template's identity header. Layout: CcnK, byteSize BE,
+    'FPCh', version, fxID, fxVersion, numPrograms, prgName[28],
+    chunkSize BE, chunk."""
+    import struct as _st
+    head = bytearray(template_fxp[:60])
+    _st.pack_into(">I", head, 56, len(chunk))
+    body = bytes(head[8:]) + chunk
+    return b"CcnK" + _st.pack(">I", len(body)) + body
+
+
 def _port_au(new_dev: ET.Element, src_chunk: bytes, src_params: dict,
-             param_map: Optional[dict]) -> tuple:
+             param_map: Optional[dict], program: Optional[int] = None) -> tuple:
     buf, plist = au_plist(new_dev)
-    if "vstdata" in plist:                         # soundhack-style FXP
-        fxp = FXP(plist["vstdata"])
+    if "vstdata" in plist:
+        vd = plist["vstdata"]
+        if vd[8:12] == b"FPCh":                    # opaque-chunk preset (bank)
+            plist["vstdata"] = _rebuild_fpch(vd, src_chunk)
+            set_au_plist(buf, plist)
+            return True, f"vstdata FPCh chunk {len(src_chunk)}B"
+        fxp = FXP(vd)                              # soundhack-style FxCk params
         order = param_order(new_dev)
         floats = fxp.floats
         mapping = param_map or {n: n for n in order}
@@ -254,6 +303,15 @@ def _port_au(new_dev: ET.Element, src_chunk: bytes, src_params: dict,
         plist["vstdata"] = fxp.with_floats(floats).raw
         set_au_plist(buf, plist)
         return True, f"FXP: {applied} params"
+    if "mCompleteData" in plist:                   # Rob Papen bank blob
+        tpl = plist["mCompleteData"] or b""
+        if tpl and src_chunk[:4].isascii() != tpl[:4].isascii():
+            return False, "source/template mCompleteData shapes differ"
+        plist["mCompleteData"] = src_chunk
+        if program is not None and "mCurPreset" in plist:
+            plist["mCurPreset"] = program
+        set_au_plist(buf, plist)
+        return True, f"mCompleteData {len(src_chunk)}B, preset #{program}"
     if "AM_STATE" in plist:                        # u-he text patch
         m = src_chunk.find(b"#AM=")
         if m < 0:
@@ -281,8 +339,8 @@ def _port_au(new_dev: ET.Element, src_chunk: bytes, src_params: dict,
         plist["jucePluginState"] = src_chunk
         set_au_plist(buf, plist)
         return True, f"jucePluginState {len(src_chunk)}B"
-    return False, ("unknown AU state layout "
-                   "(no vstdata/AM_STATE/soundtoys-data/jucePluginState)")
+    return False, ("unknown AU state layout (no vstdata/AM_STATE/"
+                   "soundtoys-data/jucePluginState/mCompleteData)")
 
 
 def _automation_target_map(old_dev: ET.Element, new_dev: ET.Element,
@@ -346,7 +404,10 @@ def _process_device(root: ET.Element, pmap: dict, dev: ET.Element,
     # AU: tag + parameter space differ, so the whole node is replaced
     new_dev = copy.deepcopy(tpl)
     T.remap_pointee_ids(root, new_dev)
-    ok, detail = _port_au(new_dev, src_chunk, param_values(dev), spec.param_map)
+    prog_e = dev.find(".//VstPreset/ProgramNumber")
+    program = int(prog_e.get("Value")) if prog_e is not None and prog_e.get("Value") else None
+    ok, detail = _port_au(new_dev, src_chunk, param_values(dev), spec.param_map,
+                          program=program)
     if not ok:
         return skipped(detail)
 
