@@ -114,7 +114,26 @@ named `.ens`, exact knob state is locked in NI's binary).
 | AU (Soundtoys) | plist key `soundtoys-data` (a plist *string*) | Same `WIDGET = ...;` text as the VST2 chunk; normalise `\r` line endings to `\n` and strip trailing NULs. |
 | AU (Rob Papen) | plist key `mCompleteData` (+ `mCurPreset`) | The whole VST2 bank blob verbatim; set `mCurPreset` from the Ableton device's `VstPreset/ProgramNumber`. |
 | AU (FPCh-style, e.g. KV331 SynthMasterCM) | plist key `vstdata` = `CcnK/FPCh` | An opaque-chunk VST2 preset container; rebuild the 60-byte header around the raw VST2 chunk (`_rebuild_fpch`). |
+| AU (iZotope-style: `data` is the only state key) | standard `data` key | Same stream the plugin's VST3 uses — the VST3 alignment rules run against the template's default data (Mobius/DDLY: strip 4-byte prefix; Ozone: zlib rewrap, below). |
 | AU (unknown layout) | — | Skipped with a report. To support a new vendor: dump the plist keys and find where state lives; add a branch in `recover._port_au`. |
+
+iZotope Ozone-era state is a zlib'd JSON "Context State" dict; VST2 wraps it in
+an old 20-byte header, AU/VST3 in `<magic 0x688ADE><ver 3><zlib_len+4><raw_len>`
+— `_izotope_rewrap` rebuilds the modern wrapper around the VST2 chunk's own
+payload, so "containers genuinely differ" turned out portable after all.
+
+**Architecture / activation lessons (Apple Silicon):**
+- Audit target-plugin arch (`file` on the bundle binary) BEFORE choosing a
+  format: Intel-only VST3s (iZotope Mobius/DDLY) are simply invisible to
+  native Live — the port "works" but the device can never load. Intel-only
+  **AUs** DO load, via macOS's out-of-process Rosetta bridge (sandbox-safe
+  ones, at least — old non-sandbox-safe AUs like SubBoomBass v1 don't bridge).
+  Preference: arm64 VST3 > bridged AU > skip-with-Rosetta-note.
+- Replacement devices must inherit the ORIGINAL device's On switch
+  (`_carry_on_state`) — template donors may have been bypassed in their source
+  project, which shipped ported devices switched off.
+- u-he VST2 param names carry a product prefix ("Tyrell: Tune2"); the AU
+  exposes the bare name — the automation relinker strips the prefix.
 
 VST3 bonus rule — **`VstW` wrapper**: some VST3s (ValhallaRoom) store their
 state as Steinberg's VST2-compat container `VstW`(16B) + `CcnK/FBCh` (bank,
