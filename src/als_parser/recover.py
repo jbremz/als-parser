@@ -54,6 +54,9 @@ class PluginSpec:
     target_fmt: str                       # "VST3" or "AU"
     target_name: Optional[str] = None     # replacement plugin name (default: vst2_name)
     param_map: Optional[dict] = None      # AU dest-param -> VST2 src-param (renamed plugins)
+    port_state: bool = True               # False = deliberate different-plugin swap:
+                                          # insert the template with its own state and
+                                          # report the old settings for manual recall
 
     def __post_init__(self):
         self.target_name = self.target_name or self.vst2_name
@@ -417,6 +420,32 @@ def _process_device(root: ET.Element, pmap: dict, dev: ET.Element,
         return Action(tname, spec.vst2_name, target, "skipped",
                       detail + (f"; recall: {refs}" if refs else ""))
 
+    if not spec.port_state:
+        # deliberate different-plugin swap: insert the template with its own
+        # state; export the old chunk so its settings can be matched by hand
+        new_dev = copy.deepcopy(tpl)
+        T.remap_pointee_ids(root, new_dev)
+        _strip_preset_refs(new_dev)
+        if new_dev.tag == "PluginDevice" and dev.tag == "PluginDevice":
+            # keep the old wrapper (automation ids etc.), graft the plugin
+            new_pd = new_dev.find("PluginDesc")
+            _replace_child(dev, dev.find("PluginDesc"), copy.deepcopy(new_pd))
+            sc = new_dev.find("SourceContext")
+            if sc is not None and dev.find("SourceContext") is not None:
+                _replace_child(dev, dev.find("SourceContext"), copy.deepcopy(sc))
+            mpe = dev.find("MpePitchBendUsesTuning")
+            if mpe is not None:
+                mpe.set("Value", "true")
+        else:
+            _replace_child(pmap[dev], dev, new_dev)
+            pmap[new_dev] = pmap[dev]
+            _unique_sibling_id(pmap[new_dev], new_dev)
+        if exports is not None:
+            exports.append((tname, spec.vst2_name, src_chunk))
+        return Action(tname, spec.vst2_name, target, "replaced",
+                      "different plugin, state NOT ported — match by hand "
+                      "(old settings exported)")
+
     if spec.target_fmt == "VST3":
         ok, detail = _convert_vst3_inplace(root, dev, tpl, src_chunk)
         if not ok:
@@ -571,7 +600,7 @@ def recover_project(als_path: Path, specs, library_paths=None,
     # report
     log("\nActions:")
     for a in actions:
-        flag = {"ported": "OK ", "swapped-no-state": "WARN", "skipped": "SKIP"}.get(a.status, "?")
+        flag = {"ported": "OK ", "replaced": "SWAP", "skipped": "SKIP"}.get(a.status, "?")
         log(f"  [{flag}] {a.track[:24]:24} {a.plugin:18} -> {a.target:24} {a.detail}")
 
     # validate + write: must serialise, re-parse, and have no sibling-id
