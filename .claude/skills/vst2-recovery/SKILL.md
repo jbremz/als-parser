@@ -173,8 +173,11 @@ AU device node without the user touching Ableton:
    must never be modified: they are the Rosetta-recoverable ground truth.
    No app duplication needed — Live is universal, so
    `arch -x86_64 ".../Ableton Live 12 Suite.app/Contents/MacOS/Live"` launches
-   it under Rosetta directly (a double-clickable "Open Live 12 in
-   ROSETTA.command" lives in the user's Ableton folder). Bonus: universal
+   it under Rosetta directly (double-clickable "Open Live 12 ROSETTA/NATIVE.command"
+   launchers live in the user's Ableton folder — they also swap per-arch
+   snapshots of Live's plugin DB (Live Database/Live-plugins-*.db +
+   PluginScanner.txt/AddOns.txt in the versioned prefs dir), so each mode
+   scans once ever instead of on every switch). Bonus: universal
    replacement plugins also load under Rosetta, so old and new can run
    side-by-side in one session for manual matching.
 5. Before injecting a legacy/cross-version state into a plugin, **pre-screen
