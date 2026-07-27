@@ -171,6 +171,12 @@ AU device node without the user touching Ableton:
    comes back and every device loads its exact state — freeze/flatten the
    affected tracks, save-as, return to native Live. This is why originals
    must never be modified: they are the Rosetta-recoverable ground truth.
+   No app duplication needed — Live is universal, so
+   `arch -x86_64 ".../Ableton Live 12 Suite.app/Contents/MacOS/Live"` launches
+   it under Rosetta directly (a double-clickable "Open Live 12 in
+   ROSETTA.command" lives in the user's Ableton folder). Bonus: universal
+   replacement plugins also load under Rosetta, so old and new can run
+   side-by-side in one session for manual matching.
 5. Before injecting a legacy/cross-version state into a plugin, **pre-screen
    headless** with `audump ... out.plist --set crafted.plist` — it sets
    ClassInfo before dumping, so the plugin's own validation runs without a
