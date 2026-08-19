@@ -36,9 +36,34 @@ int main(int argc, char **argv) {
     AudioComponent comp = AudioComponentFindNext(NULL, &desc);
     if (!comp) { fprintf(stderr, "component not found\n"); return 1; }
 
-    AudioUnit au;
-    OSStatus err = AudioComponentInstanceNew(comp, &au);
-    if (err) { fprintf(stderr, "instantiate failed: %d\n", (int)err); return 1; }
+    AudioUnit au = NULL;
+    OSStatus err = noErr;
+    /* --oop (any arg position): instantiate OUT-OF-PROCESS — macOS hosts the
+     * AU in a separate service (incl. the Rosetta compatibility service for
+     * Intel-only AUs in a native process). Tests whether a DAW's AU bridge
+     * can run this component at all. */
+    int oop = 0;
+    for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--oop") == 0) oop = 1;
+    if (oop) {
+        __block AudioUnit bau = NULL;
+        __block OSStatus berr = noErr;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        AudioComponentInstantiate(comp, kAudioComponentInstantiation_LoadOutOfProcess,
+            ^(AudioComponentInstance inst, OSStatus e) {
+                bau = inst; berr = e;
+                dispatch_semaphore_signal(sem);
+            });
+        if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
+                                    60LL * 1000000000LL)) != 0) {
+            fprintf(stderr, "OOP instantiate TIMED OUT\n"); return 1;
+        }
+        au = bau; err = berr;
+        printf("OOP instantiate result: %d %s\n", (int)err, err ? "FAIL" : "OK");
+        if (err || !au) return 1;
+    } else {
+        err = AudioComponentInstanceNew(comp, &au);
+        if (err) { fprintf(stderr, "instantiate failed: %d\n", (int)err); return 1; }
+    }
     err = AudioUnitInitialize(au);
     if (err) fprintf(stderr, "warning: init failed (%d), continuing\n", (int)err);
 

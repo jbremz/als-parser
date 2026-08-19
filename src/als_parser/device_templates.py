@@ -29,7 +29,9 @@ AU_DIRS = [
 
 
 def _norm(name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", name.lower())
+    # '+' is significant: soundhack ships distinct '+x' and '++x' variants with
+    # different parameter sets — stripping it would alias them.
+    return re.sub(r"[^a-z0-9]", "", name.lower().replace("+", "plus"))
 
 
 def installed_formats(name: str) -> dict:

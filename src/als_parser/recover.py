@@ -320,6 +320,15 @@ def _port_au(new_dev: ET.Element, src_chunk: bytes, src_params: dict,
     buf, plist = au_plist(new_dev)
     if "vstdata" in plist:
         vd = plist["vstdata"]
+        if vd[:4] != b"CcnK":
+            # raw VST2 chunk stored directly (NI Reaktor: '\x01'+'4RIN'+ver).
+            # Same-family check on the magic only — the plugin upgrades older
+            # chunk versions itself (verified for Reaktor via audump --set).
+            if vd[:5] != src_chunk[:5]:
+                return False, "vstdata raw-chunk magic differs from VST2 chunk"
+            plist["vstdata"] = src_chunk
+            set_au_plist(buf, plist)
+            return True, f"vstdata raw chunk {len(src_chunk)}B"
         if vd[8:12] == b"FPCh":                    # opaque-chunk preset (bank)
             plist["vstdata"] = _rebuild_fpch(vd, src_chunk)
             set_au_plist(buf, plist)
