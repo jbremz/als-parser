@@ -123,6 +123,20 @@ an old 20-byte header, AU/VST3 in `<magic 0x688ADE><ver 3><zlib_len+4><raw_len>`
 payload, so "containers genuinely differ" turned out portable after all.
 
 **Architecture / activation lessons (Apple Silicon):**
+- **Check `xattr` quarantine flags before declaring an AU dead or hung**: old
+  Safari-downloaded components carry `com.apple.quarantine`, and Gatekeeper
+  blocks them *silently* headless (instantiate -1, indefinite hangs) and with
+  dialog storms in GUI hosts. Clearing the flag revived three "dead" plugins.
+- Live hosts all Intel AUs in ONE Rosetta bridge service: a single crashing
+  plugin ("lost connection to the Audio Unit" on every bridged AU at the same
+  timestamp) takes the whole family down. Read the AUHostingServiceXPC crash
+  report in ~/Library/Logs/DiagnosticReports to find the one culprit — e.g.
+  BassStation aborting in CCPreference::ReadFromStore because of a stale
+  32-bit-era pref plist (1-byte <data> values); retiring the pref file fixed
+  it. Sandboxed test processes may not reproduce (different pref containers).
+- Some AUs are bridge-incompatible by declaration ("audio buffer size could
+  not be set" — KV331 SynthMasterCM): leave the dead VST2 + forge an
+  .aupreset; AU Lab (in-process x86) still plays it.
 - Audit target-plugin arch (`file` on the bundle binary) BEFORE choosing a
   format: Intel-only VST3s (iZotope Mobius/DDLY) are simply invisible to
   native Live — the port "works" but the device can never load. Intel-only
