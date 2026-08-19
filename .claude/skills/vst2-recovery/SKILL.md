@@ -134,9 +134,11 @@ payload, so "containers genuinely differ" turned out portable after all.
   BassStation aborting in CCPreference::ReadFromStore because of a stale
   32-bit-era pref plist (1-byte <data> values); retiring the pref file fixed
   it. Sandboxed test processes may not reproduce (different pref containers).
-- Some AUs are bridge-incompatible by declaration ("audio buffer size could
-  not be set" — KV331 SynthMasterCM): leave the dead VST2 + forge an
-  .aupreset; AU Lab (in-process x86) still plays it.
+- Don't trust per-plugin error messages emitted DURING a bridge crash storm:
+  "audio buffer size could not be set" (KV331 SynthMasterCM) looked like a
+  per-plugin incompatibility but was collateral of the shared service dying —
+  the same AU inserted fresh works fine. Diagnose the crasher first, retest
+  the others after it's gone.
 - Audit target-plugin arch (`file` on the bundle binary) BEFORE choosing a
   format: Intel-only VST3s (iZotope Mobius/DDLY) are simply invisible to
   native Live — the port "works" but the device can never load. Intel-only
