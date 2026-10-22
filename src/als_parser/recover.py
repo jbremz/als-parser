@@ -161,6 +161,15 @@ def _vst3_align(src: bytes, template_state_hex: str) -> Optional[int]:
         return "vstw" if _wrap_vstw(tpl, src) is not None else None
     if src[:4] == b"VC2!" and tpl[:4] == b"VC2!":
         return 0
+    if src[1:5] == b"4RIN" and tpl[1:5] == b"4RIN":
+        # Native Instruments: byte 5 is the outer format version and byte 15 the
+        # inner CSAR container version. Both must match — a Reaktor VST2 chunk
+        # can carry a modern outer byte (0x11) with an old CSAR (v5) that the
+        # VST3 (CSAR v6) silently rejects, so the first-6-bytes rule alone is
+        # not enough. Port NI plugins to their AU instead: it accepts an older
+        # chunk and upgrades it in place.
+        return 0 if (len(src) > 15 and len(tpl) > 15
+                     and src[5] == tpl[5] and src[15] == tpl[15]) else None
     if src[:6] == tpl[:6]:
         return 0
     if src[4:16] == tpl[4:16] and src[4:16] != b"\x00" * 12:

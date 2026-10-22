@@ -122,6 +122,18 @@ an old 20-byte header, AU/VST3 in `<magic 0x688ADE><ver 3><zlib_len+4><raw_len>`
 — `_izotope_rewrap` rebuilds the modern wrapper around the VST2 chunk's own
 payload, so "containers genuinely differ" turned out portable after all.
 
+**Native Instruments (Reaktor etc.) — prefer the AU:**
+Reaktor's AU accepts an older VST2 chunk in `vstdata` and upgrades it in place,
+so NI state ports exactly that way (raw-chunk branch). Its VST3 does not.
+Beware: a Reaktor VST2 chunk can carry a *modern* outer version byte (`0x11`)
+with an *old* inner `CSAR` v5 container, so comparing the first 6 bytes alone
+wrongly passes it as VST3-compatible — `_vst3_align` therefore checks byte 5
+AND byte 15 (the CSAR version) for `4RIN` chunks.
+
+**soundhack `+x` vs `++x` differ in state format, not just parameters:**
+`+phasemash` stores an FXP in `vstdata`; `++phasemash` stores a JUCE `VC2!`
+blob in `jucePluginState`. Never assume the sibling's layout.
+
 **Architecture / activation lessons (Apple Silicon):**
 - **Check `xattr` quarantine flags before declaring an AU dead or hung**: old
   Safari-downloaded components carry `com.apple.quarantine`, and Gatekeeper
